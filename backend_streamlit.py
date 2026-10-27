@@ -1,3 +1,4 @@
+import platform 
 import streamlit as st
 import subprocess
 import os
@@ -12,23 +13,6 @@ import docx
 from google import genai
 from google.genai import types
 
-# Configuration & Rclone Config Generator
-
-RCLONE_CONF_PATH = os.path.expanduser("~/.config/rclone/rclone.conf")
-
-# Otomatis buat file rclone.conf di server Cloud jika ada di st.secrets
-if "RCLONE_CONF" in st.secrets:
-    os.makedirs(os.path.dirname(RCLONE_CONF_PATH), exist_ok=True)
-    with open(RCLONE_CONF_PATH, "w", encoding="utf-8") as f:
-        f.write(str(st.secrets["RCLONE_CONF"]).strip())
-
-# Helper function untuk mengeksekusi perintah rclone
-def run_rclone_command(cmd_list):
-    full_cmd = [cmd_list[0], "--config", RCLONE_CONF_PATH] + cmd_list[1:]
-    result = subprocess.run(full_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"Rclone Error (Exit {result.returncode}): {result.stderr.strip()}")
-    return result.stdout
 
 # 1. Page Configuration & Custom CSS
 
@@ -37,6 +21,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# Color Palette Variables:
+# Primary Red: #EA0029
+# Dark Neutral: #404040
+# Medium Gray: #58595B
+# Light Gray: #6D6E71
+# Off White/Border: #E5E7EB
+# Pure White: #FFFFFF
 
 st.markdown("""
 <style>
@@ -212,12 +204,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # API Key & Path Configurations
+
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-RCLONE_EXE_PATH = "rclone"
+if platform.system() == "Windows":
+    RCLONE_EXE_PATH = r"D:\Program Files\rclone-v1.75.1-windows-amd64\rclone-v1.75.1-windows-amd64\rclone.exe"
+else:
+    RCLONE_EXE_PATH = "rclone"
 RCLONE_REMOTE_NAME = "innovation_idea_bank:"
 EXCEL_FILENAME = "20260813 Innovation_Idea_Bank_Source(AutoRecovered).xlsx"
 
 # Initialize Gemini Client
+
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Initialize Session State
@@ -227,7 +224,7 @@ if "is_processing" not in st.session_state:
     st.session_state["is_processing"] = False
 
 
-# 2. Unified System Instruction for AI Engine
+# 2. Unified System Instruction for AI Engine (Single API Call Optimization)
 
 UNIFIED_SYSTEM_INSTRUCTION = """
 You are an expert technology innovation proposal reviewer and data processing assistant.
@@ -288,8 +285,11 @@ def extract_text_from_file(file_path):
 
 
 def analyze_document_content(text_content):
-    max_retries = 5
-    base_delay = 5
+    """
+    Ekstraksi AI dengan Exponential Backoff Retry Strategy untuk menangani 503 UNAVAILABLE / 429 Rate Limit.
+    """
+    max_retries = 5  # Maksimal 5 kali percobaan ulang
+    base_delay = 5   # Jeda awal dalam detik
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -306,7 +306,7 @@ def analyze_document_content(text_content):
         except Exception as e:
             err_str = str(e)
             if ("503" in err_str or "429" in err_str or "UNAVAILABLE" in err_str) and attempt < max_retries:
-                sleep_time = base_delay * (2 ** (attempt - 1))
+                sleep_time = base_delay * (2 ** (attempt - 1))  # Exponential Backoff: 5s, 10s, 20s, 40s
                 time.sleep(sleep_time)
             else:
                 raise e
@@ -341,6 +341,7 @@ def process_excel_database_update(excel_path, doc_filename, doc_text):
     sheet_staging = wb["Raw_Staging"]
     sheet_master = wb["Idea_Master"]
 
+    # Cek apakah file sudah pernah diproses di Raw_Staging
     existing_staging_row = None
     raw_id = None
 
@@ -352,10 +353,12 @@ def process_excel_database_update(excel_path, doc_filename, doc_text):
             break
 
     if not existing_staging_row:
+        # SINGLE UNIFIED AI CALL (1 Panggilan API untuk Raw_Staging & Idea_Master)
         extracted_json = analyze_document_content(doc_text)
         data_a = extracted_json.get("idea_master", {})
         data_b = extracted_json.get("raw_staging", {})
 
+        # 1. Update Sheet Raw_Staging
         new_staging_row = find_next_available_row(
             sheet_staging,
             col_idx=2,
@@ -390,6 +393,7 @@ def process_excel_database_update(excel_path, doc_filename, doc_text):
         sheet_staging.cell(row=new_staging_row, column=13, value=data_b.get("Data_Needed"))
         sheet_staging.cell(row=new_staging_row, column=14, value=data_b.get("Key_Metrics"))
 
+        # 2. Update Sheet Idea_Master (Tuliskan Nilai Eksplisit Lengkap, Tanpa Rumus Excel)
         master_target_row = find_master_row_by_raw_id(sheet_master, raw_id)
 
         target_row = (
@@ -412,24 +416,27 @@ def process_excel_database_update(excel_path, doc_filename, doc_text):
                 value=new_idea_id
             )
 
-        sheet_master.cell(row=target_row, column=2, value=raw_id)
-        sheet_master.cell(row=target_row, column=3, value=data_b.get("Idea_Title_as_Written"))
-        sheet_master.cell(row=target_row, column=4, value=data_b.get("Source_Type"))
-        sheet_master.cell(row=target_row, column=5, value=data_b.get("Source_Name"))
-        sheet_master.cell(row=target_row, column=6, value=data_b.get("Source_Category"))
-        sheet_master.cell(row=target_row, column=7, value=data_a.get("Year"))
-        sheet_master.cell(row=target_row, column=8, value=data_b.get("Team_Participant"))
-        sheet_master.cell(row=target_row, column=9, value=data_a.get("Institution_Company"))
-        sheet_master.cell(row=target_row, column=12, value=data_a.get("Business_Area"))
-        sheet_master.cell(row=target_row, column=13, value=data_a.get("Innovation_Type"))
-        sheet_master.cell(row=target_row, column=14, value=data_a.get("Technology"))
-        sheet_master.cell(row=target_row, column=15, value=data_a.get("Benefit_Category"))
+        # Menuliskan nilai murni secara langsung ke setiap kolom Idea_Master
+        sheet_master.cell(row=target_row, column=2, value=raw_id)                                   # Raw_ID
+        sheet_master.cell(row=target_row, column=3, value=data_b.get("Idea_Title_as_Written"))      # Idea_Title
+        sheet_master.cell(row=target_row, column=4, value=data_b.get("Source_Type"))                 # Source_Type
+        sheet_master.cell(row=target_row, column=5, value=data_b.get("Source_Name"))                 # Source_Name
+        sheet_master.cell(row=target_row, column=6, value=data_b.get("Source_Category"))             # Source_Category
+        sheet_master.cell(row=target_row, column=7, value=data_a.get("Year"))                        # Year
+        sheet_master.cell(row=target_row, column=8, value=data_b.get("Team_Participant"))            # Proposer/Team
+        sheet_master.cell(row=target_row, column=9, value=data_a.get("Institution_Company"))         # Institution/Company
+        sheet_master.cell(row=target_row, column=10, value=data_b.get("Problem_as_Written"))         # Problem
+        sheet_master.cell(row=target_row, column=11, value=data_b.get("Solution_as_Written"))        # Solution
+        sheet_master.cell(row=target_row, column=12, value=data_a.get("Business_Area"))              # Business Area
+        sheet_master.cell(row=target_row, column=13, value=data_a.get("Innovation_Type"))            # Innovation Type
+        sheet_master.cell(row=target_row, column=14, value=data_a.get("Technology"))                 # Technology
+        sheet_master.cell(row=target_row, column=15, value=data_a.get("Benefit_Category"))           # Benefit Category
 
     wb.save(excel_path)
     wb.close()
 
 
-# 4. Sidebar Menu
+# 4. Sidebar Menu (Dark Visual Theme)
 
 st.sidebar.markdown(
     "<h2 style='font-size: 1.2rem; font-weight: 700; color: #FFFFFF;'>MENU</h2>",
@@ -500,7 +507,7 @@ if menu == "Upload & Process":
             ]
 
             try:
-                run_rclone_command(cmd_download_excel)
+                subprocess.run(cmd_download_excel, check=True)
 
             except Exception as e:
                 st.markdown(
@@ -517,10 +524,12 @@ if menu == "Upload & Process":
             with progress_container:
                 file_title_placeholder = st.empty()
                 
+                # Bar Biru: Total Batch Progress
                 st.markdown('<div class="blue-bar">', unsafe_allow_html=True)
                 overall_progress = st.progress(0)
                 st.markdown('</div>', unsafe_allow_html=True)
                 
+                # Bar Hijau: Single File Progress
                 st.markdown('<div class="green-bar">', unsafe_allow_html=True)
                 file_progress = st.progress(0)
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -552,7 +561,7 @@ if menu == "Upload & Process":
                         local_doc_path,
                         f"{RCLONE_REMOTE_NAME}Raw_Documents"
                     ]
-                    run_rclone_command(cmd_upload_doc)
+                    subprocess.run(cmd_upload_doc, check=True)
 
                     file_progress.progress(60)
                     doc_text = extract_text_from_file(local_doc_path)
@@ -573,6 +582,7 @@ if menu == "Upload & Process":
                             unsafe_allow_html=True
                         )
 
+                        # Record Success to History
                         st.session_state["upload_history"].append({
                             "File Name": file_item.name,
                             "Date": current_time_str,
@@ -587,6 +597,7 @@ if menu == "Upload & Process":
                             </div>""",
                             unsafe_allow_html=True
                         )
+                        # Record Error to History
                         st.session_state["upload_history"].append({
                             "File Name": file_item.name,
                             "Date": current_time_str,
@@ -602,6 +613,7 @@ if menu == "Upload & Process":
                         </div>""",
                         unsafe_allow_html=True
                     )
+                    # Record Error to History
                     st.session_state["upload_history"].append({
                         "File Name": file_item.name,
                         "Date": current_time_str,
@@ -612,6 +624,7 @@ if menu == "Upload & Process":
                     if os.path.exists(local_doc_path):
                         os.remove(local_doc_path)
                     
+                    # Update Overall Progress Bar (Bar Biru)
                     overall_progress.progress(int((index / total_files) * 100))
 
             st.markdown(
@@ -629,7 +642,7 @@ if menu == "Upload & Process":
             ]
             
             try:
-                run_rclone_command(cmd_upload_excel)
+                subprocess.run(cmd_upload_excel, check=True)
                 st.markdown(
                     """<div class="status-box-success" style="font-size: 0.88rem; padding: 10px 14px; margin-top: 12px;">
                     <b>Batch Process Complete:</b> All files processed and Cloud database synchronized successfully.
@@ -647,54 +660,64 @@ if menu == "Upload & Process":
             if os.path.exists(local_excel_path):
                 os.remove(local_excel_path)
             
+            # Reset processing state after completion
             st.session_state["is_processing"] = False
             st.rerun()
 
-    # Section: History Uploaded File Table
+    # Section: History Uploaded File Table (Rendered via Custom HTML Table)
     st.markdown("""<div class="content-card" style="margin-top: 25px;">
 <h3 style="color: #404040; margin-top: 0; font-size: 1.1rem; font-weight: 600;">History Uploaded File</h3>
 </div>""", unsafe_allow_html=True)
 
     if st.session_state["upload_history"]:
-        df_history = pd.DataFrame(st.session_state["upload_history"])
+        cleaned_history = []
+        for item in st.session_state["upload_history"]:
+            safe_status = str(item.get("Status", "")).replace("<", "&lt;").replace(">", "&gt;")
+            cleaned_history.append({
+                "File Name": item.get("File Name", ""),
+                "Date": item.get("Date", ""),
+                "Status": safe_status
+            })
+
+        # Buat DataFrame dan ubah index menjadi kolom 'No' biasa
+        df_history = pd.DataFrame(cleaned_history)
         df_history.index = range(1, len(df_history) + 1)
-        df_history.index.name = "No"
-        
-        html_table = df_history.to_html(classes="custom-history-table", escape=False)
-        
+        df_history = df_history.reset_index().rename(columns={"index": "No"})
+
         custom_table_css = """
-        <style>
-            table.custom-history-table {
-                width: 100%;
-                border-collapse: collapse;
-                background-color: #FFFFFF !important;
-                color: #000000 !important;
-                font-size: 0.85rem;
-                border: 1px solid #E5E7EB;
-                border-radius: 4px;
-                overflow: hidden;
-            }
-            table.custom-history-table th {
-                background-color: #F1F5F9 !important;
-                color: #000000 !important;
-                font-weight: 700 !important;
-                padding: 10px 12px;
-                text-align: left;
-                border-bottom: 2px solid #E5E7EB;
-            }
-            table.custom-history-table td {
-                background-color: #FFFFFF !important;
-                color: #000000 !important;
-                padding: 10px 12px;
-                border-bottom: 1px solid #E5E7EB;
-                white-space: pre-line;
-            }
-            table.custom-history-table tr:hover td {
-                background-color: #F8FAFC !important;
-            }
-        </style>
-        """
-        
+<style>
+    table.custom-history-table {
+        width: 100%;
+        border-collapse: collapse;
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        font-size: 0.85rem;
+        border: 1px solid #E5E7EB;
+        border-radius: 4px;
+        overflow: hidden;
+    }
+    table.custom-history-table th {
+        background-color: #F1F5F9 !important;
+        color: #000000 !important;
+        font-weight: 700 !important;
+        padding: 10px 12px;
+        text-align: left;
+        border-bottom: 2px solid #E5E7EB;
+    }
+    table.custom-history-table td {
+        background-color: #FFFFFF !important;
+        color: #000000 !important;
+        padding: 10px 12px;
+        border-bottom: 1px solid #E5E7EB;
+        white-space: pre-line;
+    }
+    table.custom-history-table tr:hover td {
+        background-color: #F8FAFC !important;
+    }
+</style>
+"""
+        # Gunakan index=False agar header 'No' menyatu sejajar dalam 1 baris
+        html_table = df_history.to_html(classes="custom-history-table", escape=False, index=False)
         st.markdown(custom_table_css + html_table, unsafe_allow_html=True)
     else:
         st.info("No upload history recorded yet in this session.")
@@ -722,10 +745,10 @@ elif menu == "Search & View Database":
             ]
 
             try:
-                run_rclone_command(cmd_download)
+                subprocess.run(cmd_download, check=True)
                 df_staging = pd.read_excel(
                     local_excel_path,
-                    sheet_name="Idea_Master",
+                    sheet_name="Raw_Staging",  # DIUBAH KE RAW_STAGING AGAR MENAMPILKAN DATA TEKS LANGSUNG
                     skiprows=2
                 )
                 st.session_state["df_database"] = df_staging
@@ -773,4 +796,3 @@ elif menu == "Search & View Database":
             st.dataframe(df, use_container_width=True)
     else:
         st.info("Click 'Fetch / Refresh Database' above to load records from OneDrive.")
-
